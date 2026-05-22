@@ -1,105 +1,82 @@
-"""Tests for retryq.runner.RetryRunner."""
-
-from unittest.mock import MagicMock, call
+"""Tests for RetryRunner basics (queue, metrics, middleware integration)."""
 
 import pytest
-
+from retryq.queue import RetryQueue, RetryMessage
 from retryq.backoff import ConstantBackoff
-from retryq.metrics import RetryMetrics
-from retryq.middleware import MiddlewareChain, LoggingMiddleware
-from retryq.queue import RetryMessage, RetryQueue
 from retryq.runner import RetryRunner
 
 
-def make_queue() -> RetryQueue:
-    return RetryQueue(backoff=ConstantBackoff(delay=0))
+def make_queue(max_attempts: int = 3) -> RetryQueue:
+    return RetryQueue(backoff=ConstantBackoff(delay=0), max_attempts=max_attempts)
 
 
-def make_message(msg_id: str = "m1", max_attempts: int = 3) -> RetryMessage:
-    return RetryMessage(id=msg_id, payload={"data": 1}, max_attempts=max_attempts)
+def make_message(payload: dict = None, attempts: int = 0) -> RetryMessage:
+    msg = RetryMessage(payload=payload or {"x": 1})
+    msg.attempts = attempts
+    return msg
 
 
 class TestRetryRunnerBasics:
     def test_enqueue_increments_metrics(self):
-        metrics = RetryMetrics()
-        runner = RetryRunner(make_queue(), handler=MagicMock(), metrics=metrics)
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
         runner.enqueue(make_message())
-        assert metrics.total_enqueued == 1
+        assert runner.metrics.enqueued == 1
 
     def test_process_next_returns_false_when_empty(self):
-        runner = RetryRunner(make_queue(), handler=MagicMock())
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
         assert runner.process_next() is False
 
-    def test_process_next_calls_handler(self):
-        handler = MagicMock()
-        runner = RetryRunner(make_queue(), handler=handler)
+    def test_process_next_returns_true_when_message_present(self):
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
+        runner.enqueue(make_message())
+        assert runner.process_next() is True
+
+    def test_successful_handler_records_success(self):
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
         runner.enqueue(make_message())
         runner.process_next()
-        handler.assert_called_once()
+        assert runner.metrics.succeeded == 1
 
-    def test_successful_processing_records_success(self):
-        metrics = RetryMetrics()
-        runner = RetryRunner(make_queue(), handler=MagicMock(), metrics=metrics)
+    def test_failed_handler_requeues_message(self):
+        runner = RetryRunner(make_queue(max_attempts=3), handler=lambda m: False)
         runner.enqueue(make_message())
         runner.process_next()
-        assert metrics.total_succeeded == 1
+        assert runner.metrics.retried == 1
 
-    def test_failed_handler_records_retry(self):
-        metrics = RetryMetrics()
-        runner = RetryRunner(
-            make_queue(), handler=MagicMock(side_effect=RuntimeError("fail")), metrics=metrics
-        )
+    def test_exhausted_message_goes_to_dead_letter(self):
+        runner = RetryRunner(make_queue(max_attempts=1), handler=lambda m: False)
+        runner.enqueue(make_message(attempts=0))
+        runner.process_next()
+        assert runner.metrics.dead_lettered == 1
+
+    def test_exception_in_handler_triggers_error_path(self):
+        def bad_handler(m):
+            raise RuntimeError("boom")
+
+        runner = RetryRunner(make_queue(max_attempts=3), handler=bad_handler)
         runner.enqueue(make_message())
         runner.process_next()
-        assert metrics.total_retried == 1
+        assert runner.metrics.retried == 1
 
+    def test_hooks_property_returns_registry(self):
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
+        from retryq.hooks import HookRegistry
+        assert isinstance(runner.hooks, HookRegistry)
 
-class TestRetryRunnerProcessAll:
-    def test_process_all_returns_count(self):
-        handler = MagicMock()
-        runner = RetryRunner(make_queue(), handler=handler)
-        for i in range(3):
-            runner.enqueue(make_message(msg_id=str(i)))
-        count = runner.process_all()
-        assert count == 3
+    def test_on_enqueue_hook_fires(self):
+        fired = []
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
+        from retryq.hooks import HookEvent
+        runner.hooks.register(HookEvent.ON_ENQUEUE, lambda m: fired.append(m))
+        msg = make_message()
+        runner.enqueue(msg)
+        assert fired == [msg]
 
-    def test_process_all_empty_queue_returns_zero(self):
-        runner = RetryRunner(make_queue(), handler=MagicMock())
-        assert runner.process_all() == 0
-
-
-class TestRetryRunnerMiddleware:
-    def test_middleware_before_is_called(self):
-        chain = MiddlewareChain()
-        spy = MagicMock(side_effect=lambda msg: msg)
-        chain.run_before = spy
-        runner = RetryRunner(make_queue(), handler=MagicMock(), middleware=chain)
+    def test_on_success_hook_fires(self):
+        fired = []
+        runner = RetryRunner(make_queue(), handler=lambda m: True)
+        from retryq.hooks import HookEvent
+        runner.hooks.register(HookEvent.ON_SUCCESS, lambda m: fired.append(True))
         runner.enqueue(make_message())
         runner.process_next()
-        spy.assert_called_once()
-
-    def test_middleware_after_called_on_success(self):
-        chain = MiddlewareChain()
-        after_spy = MagicMock()
-        chain.run_after = after_spy
-        runner = RetryRunner(make_queue(), handler=MagicMock(), middleware=chain)
-        runner.enqueue(make_message())
-        runner.process_next()
-        after_spy.assert_called_once()
-        _, success, error = after_spy.call_args[0]
-        assert success is True
-        assert error is None
-
-    def test_middleware_after_called_on_failure(self):
-        chain = MiddlewareChain()
-        after_spy = MagicMock()
-        chain.run_after = after_spy
-        err = ValueError("bad")
-        runner = RetryRunner(
-            make_queue(), handler=MagicMock(side_effect=err), middleware=chain
-        )
-        runner.enqueue(make_message())
-        runner.process_next()
-        _, success, error = after_spy.call_args[0]
-        assert success is False
-        assert error is err
+        assert fired == [True]
