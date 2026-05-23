@@ -52,6 +52,26 @@ class TestRetryQueueIntegration:
 
         assert dead_letters == ["important-task"]
 
+    def test_dead_letter_callback_receives_attempt_count(self):
+        """Verify the exhausted message carries the correct attempt count when dead-lettered."""
+        exhausted_msgs = []
+
+        def on_exhausted(msg: RetryMessage):
+            exhausted_msgs.append(msg)
+
+        q = RetryQueue(
+            handler=MagicMock(side_effect=Exception("always fails")),
+            backoff=ConstantBackoff(delay=0),
+            max_attempts=3,
+            on_exhausted=on_exhausted,
+        )
+        q.enqueue("tracked-task")
+        q.drain(dry_run=True)
+
+        assert len(exhausted_msgs) == 1
+        assert exhausted_msgs[0].payload == "tracked-task"
+        assert exhausted_msgs[0].attempts == 3
+
     def test_multiple_messages_independent_retry_counts(self):
         results = []
         fail_payloads = {"fail-me"}
