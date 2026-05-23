@@ -57,7 +57,7 @@ class TestRetryScheduler:
         assert self.scheduler.pending_count == 1
 
     def test_schedule_returns_scheduled_retry(self):
-        msg = make_message()
+        msg = make_message()        
         entry = self.scheduler.schedule(msg)
         assert isinstance(entry, ScheduledRetry)
         assert entry.message is msg
@@ -93,15 +93,20 @@ class TestRetryScheduler:
         self.clock_value = 10.0
         self.scheduler.flush_due()
         assert self.queue.size() == 1
+        queued_msg = self.queue.dequeue()
+        assert queued_msg is msg
 
-    def test_multiple_messages_only_due_flushed(self):
-        msg1 = make_message()
-        msg2 = make_message()
+    def test_flush_due_mixed_ready_and_pending(self):
+        """Only due messages are flushed when some are ready and some are not."""
         self.clock_value = 0.0
-        self.scheduler.schedule(msg1)  # retry_at = 5.0
-        self.clock_value = 3.0
-        self.scheduler.schedule(msg2)  # retry_at = 8.0
-        self.clock_value = 6.0
+        ready_msg = make_message(payload={"task": "ready"})
+        waiting_msg = make_message(payload={"task": "waiting"})
+
+        self.scheduler.schedule(ready_msg)
+        self.clock_value = 3.0  # advance clock so next schedule uses a later base
+        self.scheduler.schedule(waiting_msg)  # retry_at = 3.0 + 5.0 = 8.0
+
+        self.clock_value = 6.0  # past ready_msg (5.0) but before waiting_msg (8.0)
         flushed = self.scheduler.flush_due()
         assert flushed == 1
         assert self.scheduler.pending_count == 1
